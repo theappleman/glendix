@@ -1,17 +1,25 @@
 /*
- * Copyright 2009 The Glendix Project
- * Author(s): Rahul Murmuria <rahul at murmuria dot in>
+ * Copyright 2009 Rahul Murmuria <rahul@murmuria.in>
  * This file may be redistributed under the terms of the GNU GPL.
- * 
- * Code design courtesy of http://lwn.net
+ * Most of this program has been adapted from the design of lwnfs 
+ * from http://lwn.net which is a sample implementation over libfs.
  */
 
-#include "netfs.h"
+#include <linux/slab.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/pagemap.h> 	/* PAGE_CACHE_SIZE */
+#include <linux/fs.h>     	/* This is where libfs stuff is declared */
+#include <asm/atomic.h>
+#include <asm/uaccess.h>	/* copy_to_user */
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Rahul Murmuria <rahul at murmuria dot in>");
+MODULE_AUTHOR("Rahul Murmuria <rahul@murmuria.in>");
 
-inline unsigned int blksize_bits(unsigned int size)
+#define NET_MAGIC 0x19980122
+
+static inline unsigned int blksize_bits(unsigned int size)
 {
     unsigned int bits = 8;
     do {
@@ -20,6 +28,10 @@ inline unsigned int blksize_bits(unsigned int size)
     } while (size > 256);
     return bits;
 }
+
+static char *buffer;
+
+#define TMPSIZE 128
 
 static struct inode *slashnet_make_inode(struct super_block *sb, int mode)
 {
@@ -45,6 +57,7 @@ static struct inode *slashnet_make_inode(struct super_block *sb, int mode)
  */
 static int slashnet_open(struct inode *inode, struct file *filp)
 {
+	inode->i_private = kmalloc(TMPSIZE, GFP_KERNEL);
 	filp->private_data = inode->i_private;
 	return 0;
 }
@@ -55,18 +68,19 @@ static int slashnet_open(struct inode *inode, struct file *filp)
 static ssize_t slashnet_read_file(struct file *filp, char *dnsquery,
 		size_t count, loff_t *offset)
 {
-	int len, retval;
-	len = strlen(filp->private_data);
+	char tmp[TMPSIZE];
+	int len;
+	memcpy (tmp, buffer, sizeof(tmp));
+	len = sizeof(buffer);
 	if (*offset > len)
 		return 0;
 	if (count > len - *offset)
 		count = len - *offset;
-	
-	retval = copy_to_user(dnsquery, filp->private_data + *offset, count);
-
-	if (retval)
+	if (copy_to_user(dnsquery, tmp + *offset, count))
 		return -EFAULT;
 	
+	/* debug */
+	printk("*** value of count in read: %d ***\n", count);
 	*offset += count;
 	return count;
 }
@@ -77,8 +91,8 @@ static ssize_t slashnet_read_file(struct file *filp, char *dnsquery,
 static ssize_t slashnet_write_file(struct file *filp, const char *dnsquery,
 		size_t count, loff_t *offset)
 {
-	char *tmp;
-	tmp = (char *)(filp->private_data);
+	char tmp[TMPSIZE];
+	buffer = (char *)(filp->private_data);
 	
 	if (*offset != 0)
 		return -EINVAL;
@@ -87,23 +101,15 @@ static ssize_t slashnet_write_file(struct file *filp, const char *dnsquery,
 	if(copy_from_user(tmp, dnsquery, count))
 		return -EFAULT;
 	tmp[count-1] = '\0';
-	
-	if (!strcmp(filp->f_dentry->d_name.name, "clone") && 
-		!strcmp(filp->f_dentry->d_parent->d_name.name, "tcp"))
-		tcp_clone_process(filp);
-	else if (!strcmp(filp->f_dentry->d_name.name, "ctl") &&
-		!strcmp(filp->f_dentry->d_parent->d_parent->d_name.name,"tcp"))
-		tcp_n_ctl_process(filp);
-	else if (!strcmp(filp->f_dentry->d_name.name, "data") &&
-		!strcmp(filp->f_dentry->d_parent->d_parent->d_name.name,"tcp"))
-		tcp_n_data_process(filp);
-	else if (!strcmp(filp->f_dentry->d_name.name, "cs") && 
-		!strcmp(filp->f_dentry->d_parent->d_name.name, "/"))
-		slashnet_cs_process(filp);
-
+	memcpy (buffer, tmp, count);
 	/* debug */
-//	printk("*** %s/%s: %s ***\n", filp->f_dentry->d_parent->d_name.name,
-//		filp->f_dentry->d_name.name, (char *) filp->private_data);
+	printk("*** value buffer has in write_file: %s ***\n", (char *) filp->private_data);
+	
+/* 
+ * Although private_data has required info here, it doesnot retain 
+ * its value by the time we reach slashnet_read_file. Hence we are 
+ * currently using a static global variable, buffer. 
+ */
 	
 	return count;
 }
@@ -118,10 +124,11 @@ static struct file_operations slashnet_file_ops = {
 	.write  = slashnet_write_file,
 };
 
+
 /*
  * Create a file.
  */
-struct dentry *slashnet_create_file (struct super_block *sb,
+static struct dentry *slashnet_create_file (struct super_block *sb,
 		struct dentry *dir, const char *name, char *initval)
 {
 	struct dentry *dentry;
@@ -144,6 +151,8 @@ struct dentry *slashnet_create_file (struct super_block *sb,
 		goto out_dput;
 	inode->i_fop = &slashnet_file_ops;
 	inode->i_private = initval;
+	/* debug */
+	printk("*** %s: initial val is %s ***\n", name, initval);
 
 /*
  * Put it all into the dentry cache and we're done.
@@ -165,7 +174,7 @@ struct dentry *slashnet_create_file (struct super_block *sb,
  * almost identical to the "create file" logic, except that we create
  * the inode with a different mode, and use the libfs "simple" operations.
  */
-struct dentry *slashnet_create_dir (struct super_block *sb,
+static struct dentry *slashnet_create_dir (struct super_block *sb,
 		struct dentry *parent, const char *name)
 {
 	struct dentry *dentry;
@@ -195,31 +204,6 @@ struct dentry *slashnet_create_dir (struct super_block *sb,
 }
 
 
-/*
- * Function to create new connection folder named n
- * to be called when the net folder n-1 is busy.
- */
-
-struct dentry *slashnet_create_netfolder(struct super_block *sb, 
-				struct dentry *dir, const char *n)
-{
-	static char *ctl_tmp, *data_tmp;
-	struct dentry *subdir;
-
-	subdir = slashnet_create_dir(sb, dir, n);
-	if (subdir) {
-		ctl_tmp = kmalloc(TMPSIZE, GFP_KERNEL);
-		memset (ctl_tmp, 0, TMPSIZE);
-		slashnet_create_file(sb, subdir, "ctl", ctl_tmp);
-
-		data_tmp = kmalloc(TMPSIZE, GFP_KERNEL);
-		memset (data_tmp, 0, TMPSIZE);
-		slashnet_create_file(sb, subdir, "data", data_tmp);
-	}
-
-	return subdir;
-}
-
 
 /*
  * Create the files that we export.
@@ -227,11 +211,14 @@ struct dentry *slashnet_create_netfolder(struct super_block *sb,
 
 static void slashnet_create_files (struct super_block *sb, struct dentry *root)
 {
-	cs_create_files (sb, root);
-	tcp_create_files (sb, root);
-	udp_create_files (sb, root);
-	ether_create_files (sb, root);
+	buffer = kmalloc(TMPSIZE, GFP_KERNEL);
+	memset (buffer, 0, TMPSIZE);
+	slashnet_create_file(sb, root, "cs", buffer);
+	slashnet_create_dir(sb, root, "tcp");
+	kfree(buffer);
 }
+
+
 
 
 /*
